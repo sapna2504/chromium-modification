@@ -1,0 +1,560 @@
+From: Your Name <you@example.com>
+Date: Sun, 30 Feb 2022 00:00:00 +0000
+Subject: [PATCH] Stop fallback
+
+---
+ net/http/alternative_service.cc               |   4 +-
+ net/http/broken_alternative_services.cc       | 376 +++++++++---------
+ .../http_stream_factory_job_controller.cc     |  54 ++-
+ net/quic/quic_context.h                       |   2 +-
+ 4 files changed, 224 insertions(+), 212 deletions(-)
+
+diff --git a/net/http/alternative_service.cc b/net/http/alternative_service.cc
+index f713303c2af..129851e905f 100644
+--- a/net/http/alternative_service.cc
++++ b/net/http/alternative_service.cc
+@@ -37,7 +37,7 @@ bool IsAlternateProtocolValid(NextProto protocol) {
+     case kProtoHTTP11:
+       return false;
+     case kProtoHTTP2:
+-      return true;
++      return false;
+     case kProtoQUIC:
+       return true;
+   }
+@@ -55,7 +55,7 @@ bool IsProtocolEnabled(NextProto protocol,
+     case kProtoHTTP11:
+       return true;
+     case kProtoHTTP2:
+-      return is_http2_enabled;
++      return false;
+     case kProtoQUIC:
+       return is_quic_enabled;
+   }
+diff --git a/net/http/broken_alternative_services.cc b/net/http/broken_alternative_services.cc
+index 865277568c4..5fadf9433bb 100644
+--- a/net/http/broken_alternative_services.cc
++++ b/net/http/broken_alternative_services.cc
+@@ -19,41 +19,41 @@ namespace {
+ // exponential_backoff_on_initial_delay is false.
+ constexpr base::TimeDelta kDefaultBrokenAlternativeProtocolDelay =
+     base::Seconds(300);
+-// Subsequent failures result in exponential (base 2) backoff.
+-// Given the shortest broken delay is 1s, limit binary shift to limit delay to
+-// approximately 2 days.
+-const int kBrokenDelayMaxShift = 18;
+-// Lower and upper limits of broken alternative service delay.
+-constexpr base::TimeDelta kMinBrokenAlternativeProtocolDelay = base::Seconds(1);
+-constexpr base::TimeDelta kMaxBrokenAlternativeProtocolDelay = base::Days(2);
+-
+-base::TimeDelta ComputeBrokenAlternativeServiceExpirationDelay(
+-    int broken_count,
+-    base::TimeDelta initial_delay,
+-    bool exponential_backoff_on_initial_delay) {
+-  DCHECK_GE(broken_count, 0);
+-  // Make sure initial delay is within [1s, 300s].
+-  if (initial_delay < kMinBrokenAlternativeProtocolDelay) {
+-    initial_delay = kMinBrokenAlternativeProtocolDelay;
+-  }
+-  if (initial_delay > kDefaultBrokenAlternativeProtocolDelay) {
+-    initial_delay = kDefaultBrokenAlternativeProtocolDelay;
+-  }
+-  if (broken_count == 0) {
+-    return initial_delay;
+-  }
+-  // Limit broken_count to avoid overflow.
+-  if (broken_count > kBrokenDelayMaxShift) {
+-    broken_count = kBrokenDelayMaxShift;
+-  }
+-  base::TimeDelta delay;
+-  if (exponential_backoff_on_initial_delay) {
+-    delay = initial_delay * (1 << broken_count);
+-  } else {
+-    delay = kDefaultBrokenAlternativeProtocolDelay * (1 << (broken_count - 1));
+-  }
+-  return std::min(delay, kMaxBrokenAlternativeProtocolDelay);
+-}
++// // Subsequent failures result in exponential (base 2) backoff.
++// // Given the shortest broken delay is 1s, limit binary shift to limit delay to
++// // approximately 2 days.
++// const int kBrokenDelayMaxShift = 18;
++// // Lower and upper limits of broken alternative service delay.
++// constexpr base::TimeDelta kMinBrokenAlternativeProtocolDelay = base::Seconds(1);
++// constexpr base::TimeDelta kMaxBrokenAlternativeProtocolDelay = base::Days(2);
++
++// base::TimeDelta ComputeBrokenAlternativeServiceExpirationDelay(
++//     int broken_count,
++//     base::TimeDelta initial_delay,
++//     bool exponential_backoff_on_initial_delay) {
++//   DCHECK_GE(broken_count, 0);
++//   // Make sure initial delay is within [1s, 300s].
++//   if (initial_delay < kMinBrokenAlternativeProtocolDelay) {
++//     initial_delay = kMinBrokenAlternativeProtocolDelay;
++//   }
++//   if (initial_delay > kDefaultBrokenAlternativeProtocolDelay) {
++//     initial_delay = kDefaultBrokenAlternativeProtocolDelay;
++//   }
++//   if (broken_count == 0) {
++//     return initial_delay;
++//   }
++//   // Limit broken_count to avoid overflow.
++//   if (broken_count > kBrokenDelayMaxShift) {
++//     broken_count = kBrokenDelayMaxShift;
++//   }
++//   base::TimeDelta delay;
++//   if (exponential_backoff_on_initial_delay) {
++//     delay = initial_delay * (1 << broken_count);
++//   } else {
++//     delay = kDefaultBrokenAlternativeProtocolDelay * (1 << (broken_count - 1));
++//   }
++//   return std::min(delay, kMaxBrokenAlternativeProtocolDelay);
++// }
+ 
+ }  // namespace
+ 
+@@ -98,68 +98,68 @@ void BrokenAlternativeServices::Clear() {
+ 
+ void BrokenAlternativeServices::MarkBrokenUntilDefaultNetworkChanges(
+     const BrokenAlternativeService& broken_alternative_service) {
+-  DCHECK(!broken_alternative_service.alternative_service.host.empty());
+-  DCHECK_NE(kProtoUnknown,
+-            broken_alternative_service.alternative_service.protocol);
+-
+-  // The brokenness will expire on the default network change or based on
+-  // timer.
+-  broken_alternative_services_on_default_network_.insert(
+-      broken_alternative_service);
+-  MarkBrokenImpl(broken_alternative_service);
++  // DCHECK(!broken_alternative_service.alternative_service.host.empty());
++  // DCHECK_NE(kProtoUnknown,
++  //           broken_alternative_service.alternative_service.protocol);
++
++  // // The brokenness will expire on the default network change or based on
++  // // timer.
++  // broken_alternative_services_on_default_network_.insert(
++  //     broken_alternative_service);
++  // MarkBrokenImpl(broken_alternative_service);
+ }
+ 
+ void BrokenAlternativeServices::MarkBroken(
+     const BrokenAlternativeService& broken_alternative_service) {
+-  // The brokenness expires based only on the timer, not on the default network
+-  // change.
+-  broken_alternative_services_on_default_network_.erase(
+-      broken_alternative_service);
+-  MarkBrokenImpl(broken_alternative_service);
++  // // The brokenness expires based only on the timer, not on the default network
++  // // change.
++  // broken_alternative_services_on_default_network_.erase(
++  //     broken_alternative_service);
++  // MarkBrokenImpl(broken_alternative_service);
+ }
+ 
+ void BrokenAlternativeServices::MarkBrokenImpl(
+     const BrokenAlternativeService& broken_alternative_service) {
+-  // Empty host means use host of origin, callers are supposed to substitute.
+-  DCHECK(!broken_alternative_service.alternative_service.host.empty());
+-  DCHECK_NE(kProtoUnknown,
+-            broken_alternative_service.alternative_service.protocol);
+-
+-  auto it =
+-      recently_broken_alternative_services_.Get(broken_alternative_service);
+-  int broken_count = 0;
+-  if (it == recently_broken_alternative_services_.end()) {
+-    recently_broken_alternative_services_.Put(broken_alternative_service, 1);
+-  } else {
+-    broken_count = it->second++;
+-  }
+-  base::TimeTicks expiration =
+-      clock_->NowTicks() +
+-      ComputeBrokenAlternativeServiceExpirationDelay(
+-          broken_count, initial_delay_, exponential_backoff_on_initial_delay_);
+-  // Return if alternative service is already in expiration queue.
+-  BrokenAlternativeServiceList::iterator list_it;
+-  if (!AddToBrokenListAndMap(broken_alternative_service, expiration,
+-                             &list_it)) {
+-    return;
+-  }
+-
+-  // If this is now the first entry in the list (i.e.
+-  // |broken_alternative_service| is the next alt svc to expire), schedule
+-  // an expiration task for it.
+-  if (list_it == broken_alternative_service_list_.begin()) {
+-    ScheduleBrokenAlternateProtocolMappingsExpiration();
+-  }
++  // // Empty host means use host of origin, callers are supposed to substitute.
++  // DCHECK(!broken_alternative_service.alternative_service.host.empty());
++  // DCHECK_NE(kProtoUnknown,
++  //           broken_alternative_service.alternative_service.protocol);
++
++  // auto it =
++  //     recently_broken_alternative_services_.Get(broken_alternative_service);
++  // int broken_count = 0;
++  // if (it == recently_broken_alternative_services_.end()) {
++  //   recently_broken_alternative_services_.Put(broken_alternative_service, 1);
++  // } else {
++  //   broken_count = it->second++;
++  // }
++  // base::TimeTicks expiration =
++  //     clock_->NowTicks() +
++  //     ComputeBrokenAlternativeServiceExpirationDelay(
++  //         broken_count, initial_delay_, exponential_backoff_on_initial_delay_);
++  // // Return if alternative service is already in expiration queue.
++  // BrokenAlternativeServiceList::iterator list_it;
++  // if (!AddToBrokenListAndMap(broken_alternative_service, expiration,
++  //                            &list_it)) {
++  //   return;
++  // }
++
++  // // If this is now the first entry in the list (i.e.
++  // // |broken_alternative_service| is the next alt svc to expire), schedule
++  // // an expiration task for it.
++  // if (list_it == broken_alternative_service_list_.begin()) {
++  //   ScheduleBrokenAlternateProtocolMappingsExpiration();
++  // }
+ }
+ 
+ void BrokenAlternativeServices::MarkRecentlyBroken(
+     const BrokenAlternativeService& broken_alternative_service) {
+-  DCHECK_NE(kProtoUnknown,
+-            broken_alternative_service.alternative_service.protocol);
+-  if (recently_broken_alternative_services_.Get(broken_alternative_service) ==
+-      recently_broken_alternative_services_.end()) {
+-    recently_broken_alternative_services_.Put(broken_alternative_service, 1);
+-  }
++  // DCHECK_NE(kProtoUnknown,
++  //           broken_alternative_service.alternative_service.protocol);
++  // if (recently_broken_alternative_services_.Get(broken_alternative_service) ==
++  //     recently_broken_alternative_services_.end()) {
++  //   recently_broken_alternative_services_.Put(broken_alternative_service, 1);
++  // }
+ }
+ 
+ bool BrokenAlternativeServices::IsBroken(
+@@ -234,84 +234,84 @@ void BrokenAlternativeServices::SetBrokenAndRecentlyBrokenAlternativeServices(
+         broken_alternative_service_list,
+     std::unique_ptr<RecentlyBrokenAlternativeServices>
+         recently_broken_alternative_services) {
+-  DCHECK(broken_alternative_service_list);
+-  DCHECK(recently_broken_alternative_services);
+-
+-  base::TimeTicks next_expiration =
+-      broken_alternative_service_list_.empty()
+-          ? base::TimeTicks::Max()
+-          : broken_alternative_service_list_.front().second;
+-
+-  // Add |recently_broken_alternative_services| to
+-  // |recently_broken_alternative_services_|.
+-  // If an alt-svc already exists, overwrite its broken-count to the one in
+-  // |recently_broken_alternative_services|.
+-
+-  recently_broken_alternative_services_.Swap(
+-      *recently_broken_alternative_services);
+-  // Add back all existing recently broken alt svcs to cache so they're at
+-  // front of recency list (LRUCache::Get() does this automatically).
+-  for (const auto& [service, broken_count] :
+-       base::Reversed(*recently_broken_alternative_services)) {
+-    if (recently_broken_alternative_services_.Get(service) ==
+-        recently_broken_alternative_services_.end()) {
+-      recently_broken_alternative_services_.Put(service, broken_count);
+-    }
+-  }
+-
+-  // Append |broken_alternative_service_list| to
+-  // |broken_alternative_service_list_|
+-  size_t num_broken_alt_svcs_added = broken_alternative_service_list->size();
+-  broken_alternative_service_list_.splice(
+-      broken_alternative_service_list_.begin(),
+-      *broken_alternative_service_list);
+-  // For each newly-appended alt svc in |broken_alternative_service_list_|,
+-  // add an entry to |broken_alternative_service_map_| that points to its
+-  // list iterator. Also, add an entry for that alt svc in
+-  // |recently_broken_alternative_services_| if one doesn't exist.
+-  auto list_it = broken_alternative_service_list_.begin();
+-  for (size_t i = 0; i < num_broken_alt_svcs_added; ++i) {
+-    const BrokenAlternativeService& broken_alternative_service = list_it->first;
+-    auto map_it =
+-        broken_alternative_service_map_.find(broken_alternative_service);
+-    if (map_it != broken_alternative_service_map_.end()) {
+-      // Implies this entry already exists somewhere else in
+-      // |broken_alternative_service_list_|. Remove the existing entry from
+-      // |broken_alternative_service_list_|, and update the
+-      // |broken_alternative_service_map_| entry to point to this list entry
+-      // instead.
+-      auto list_existing_entry_it = map_it->second;
+-      broken_alternative_service_list_.erase(list_existing_entry_it);
+-      map_it->second = list_it;
+-    } else {
+-      broken_alternative_service_map_.insert(
+-          std::make_pair(broken_alternative_service, list_it));
+-    }
+-
+-    if (recently_broken_alternative_services_.Peek(
+-            broken_alternative_service) ==
+-        recently_broken_alternative_services_.end()) {
+-      recently_broken_alternative_services_.Put(broken_alternative_service, 1);
+-    }
+-
+-    ++list_it;
+-  }
+-
+-  // Sort |broken_alternative_service_list_| by expiration time. This operation
+-  // does not invalidate list iterators, so |broken_alternative_service_map_|
+-  // does not need to be updated.
+-  broken_alternative_service_list_.sort(
+-      [](const std::pair<BrokenAlternativeService, base::TimeTicks>& lhs,
+-         const std::pair<BrokenAlternativeService, base::TimeTicks>& rhs)
+-          -> bool { return lhs.second < rhs.second; });
+-
+-  base::TimeTicks new_next_expiration =
+-      broken_alternative_service_list_.empty()
+-          ? base::TimeTicks::Max()
+-          : broken_alternative_service_list_.front().second;
+-
+-  if (new_next_expiration != next_expiration)
+-    ScheduleBrokenAlternateProtocolMappingsExpiration();
++  // DCHECK(broken_alternative_service_list);
++  // DCHECK(recently_broken_alternative_services);
++
++  // base::TimeTicks next_expiration =
++  //     broken_alternative_service_list_.empty()
++  //         ? base::TimeTicks::Max()
++  //         : broken_alternative_service_list_.front().second;
++
++  // // Add |recently_broken_alternative_services| to
++  // // |recently_broken_alternative_services_|.
++  // // If an alt-svc already exists, overwrite its broken-count to the one in
++  // // |recently_broken_alternative_services|.
++
++  // recently_broken_alternative_services_.Swap(
++  //     *recently_broken_alternative_services);
++  // // Add back all existing recently broken alt svcs to cache so they're at
++  // // front of recency list (LRUCache::Get() does this automatically).
++  // for (const auto& [service, broken_count] :
++  //      base::Reversed(*recently_broken_alternative_services)) {
++  //   if (recently_broken_alternative_services_.Get(service) ==
++  //       recently_broken_alternative_services_.end()) {
++  //     recently_broken_alternative_services_.Put(service, broken_count);
++  //   }
++  // }
++
++  // // Append |broken_alternative_service_list| to
++  // // |broken_alternative_service_list_|
++  // size_t num_broken_alt_svcs_added = broken_alternative_service_list->size();
++  // broken_alternative_service_list_.splice(
++  //     broken_alternative_service_list_.begin(),
++  //     *broken_alternative_service_list);
++  // // For each newly-appended alt svc in |broken_alternative_service_list_|,
++  // // add an entry to |broken_alternative_service_map_| that points to its
++  // // list iterator. Also, add an entry for that alt svc in
++  // // |recently_broken_alternative_services_| if one doesn't exist.
++  // auto list_it = broken_alternative_service_list_.begin();
++  // for (size_t i = 0; i < num_broken_alt_svcs_added; ++i) {
++  //   const BrokenAlternativeService& broken_alternative_service = list_it->first;
++  //   auto map_it =
++  //       broken_alternative_service_map_.find(broken_alternative_service);
++  //   if (map_it != broken_alternative_service_map_.end()) {
++  //     // Implies this entry already exists somewhere else in
++  //     // |broken_alternative_service_list_|. Remove the existing entry from
++  //     // |broken_alternative_service_list_|, and update the
++  //     // |broken_alternative_service_map_| entry to point to this list entry
++  //     // instead.
++  //     auto list_existing_entry_it = map_it->second;
++  //     broken_alternative_service_list_.erase(list_existing_entry_it);
++  //     map_it->second = list_it;
++  //   } else {
++  //     broken_alternative_service_map_.insert(
++  //         std::make_pair(broken_alternative_service, list_it));
++  //   }
++
++  //   if (recently_broken_alternative_services_.Peek(
++  //           broken_alternative_service) ==
++  //       recently_broken_alternative_services_.end()) {
++  //     recently_broken_alternative_services_.Put(broken_alternative_service, 1);
++  //   }
++
++  //   ++list_it;
++  // }
++
++  // // Sort |broken_alternative_service_list_| by expiration time. This operation
++  // // does not invalidate list iterators, so |broken_alternative_service_map_|
++  // // does not need to be updated.
++  // broken_alternative_service_list_.sort(
++  //     [](const std::pair<BrokenAlternativeService, base::TimeTicks>& lhs,
++  //        const std::pair<BrokenAlternativeService, base::TimeTicks>& rhs)
++  //         -> bool { return lhs.second < rhs.second; });
++
++  // base::TimeTicks new_next_expiration =
++  //     broken_alternative_service_list_.empty()
++  //         ? base::TimeTicks::Max()
++  //         : broken_alternative_service_list_.front().second;
++
++  // if (new_next_expiration != next_expiration)
++  //   ScheduleBrokenAlternateProtocolMappingsExpiration();
+ }
+ 
+ void BrokenAlternativeServices::SetDelayParams(
+@@ -340,31 +340,31 @@ bool BrokenAlternativeServices::AddToBrokenListAndMap(
+     const BrokenAlternativeService& broken_alternative_service,
+     base::TimeTicks expiration,
+     BrokenAlternativeServiceList::iterator* it) {
+-  DCHECK(it);
+-
+-  auto map_it =
+-      broken_alternative_service_map_.find(broken_alternative_service);
+-  if (map_it != broken_alternative_service_map_.end())
+-    return false;
+-
+-  // Iterate from end of |broken_alternative_service_list_| to find where to
+-  // insert it to keep the list sorted by expiration time.
+-  auto list_it = broken_alternative_service_list_.end();
+-  while (list_it != broken_alternative_service_list_.begin()) {
+-    --list_it;
+-    if (list_it->second <= expiration) {
+-      ++list_it;
+-      break;
+-    }
+-  }
+-
+-  // Insert |broken_alternative_service| into the list and the map.
+-  list_it = broken_alternative_service_list_.insert(
+-      list_it, std::make_pair(broken_alternative_service, expiration));
+-  broken_alternative_service_map_.insert(
+-      std::make_pair(broken_alternative_service, list_it));
+-
+-  *it = list_it;
++  // DCHECK(it);
++
++  // auto map_it =
++  //     broken_alternative_service_map_.find(broken_alternative_service);
++  // if (map_it != broken_alternative_service_map_.end())
++  //   return false;
++
++  // // Iterate from end of |broken_alternative_service_list_| to find where to
++  // // insert it to keep the list sorted by expiration time.
++  // auto list_it = broken_alternative_service_list_.end();
++  // while (list_it != broken_alternative_service_list_.begin()) {
++  //   --list_it;
++  //   if (list_it->second <= expiration) {
++  //     ++list_it;
++  //     break;
++  //   }
++  // }
++
++  // // Insert |broken_alternative_service| into the list and the map.
++  // list_it = broken_alternative_service_list_.insert(
++  //     list_it, std::make_pair(broken_alternative_service, expiration));
++  // broken_alternative_service_map_.insert(
++  //     std::make_pair(broken_alternative_service, list_it));
++
++  // *it = list_it;
+   return true;
+ }
+ 
+diff --git a/net/http/http_stream_factory_job_controller.cc b/net/http/http_stream_factory_job_controller.cc
+index 19dd80b8150..93b33a1e671 100644
+--- a/net/http/http_stream_factory_job_controller.cc
++++ b/net/http/http_stream_factory_job_controller.cc
+@@ -99,7 +99,7 @@ void HistogramProxyUsed(const ProxyInfo& proxy_info, bool success) {
+ 
+ // The maximum time to wait for the alternate job to complete before resuming
+ // the main job.
+-const int kMaxDelayTimeForMainJobSecs = 3;
++const int kMaxDelayTimeForMainJobSecs = 30;
+ 
+ base::Value NetLogJobControllerParams(const HttpRequestInfo& request_info,
+                                       bool is_preconnect) {
+@@ -222,10 +222,10 @@ LoadState HttpStreamFactory::JobController::GetLoadState() const {
+     return proxy_resolve_request_->GetLoadState();
+   if (bound_job_)
+     return bound_job_->GetLoadState();
+-  if (main_job_)
+-    return main_job_->GetLoadState();
+   if (alternative_job_)
+     return alternative_job_->GetLoadState();
++  if (main_job_)
++    return main_job_->GetLoadState();
+   // When proxy resolution fails, there is no job created and
+   // NotifyRequestFailed() is executed one message loop iteration later.
+   return LOAD_STATE_IDLE;
+@@ -378,11 +378,21 @@ void HttpStreamFactory::JobController::OnStreamFailed(
+       // ignore this failure.
+       if (job->job_type() == MAIN) {
+         main_job_.reset();
++        return;
+       } else {
+         DCHECK(job->job_type() == ALTERNATIVE);
+-        alternative_job_.reset();
++        // alternative_job_.reset();
++        main_job_.reset();
++        ResetErrorStatusForJobs();
++        // Also resets states that related to the old main job. In particular,
++        // cancels |resume_main_job_callback_| so there won't be any delayed
++        // ResumeMainJob() left in the task queue.
++        resume_main_job_callback_.Cancel();
++        main_job_is_resumed_ = false;
++        main_job_is_blocked_ = false;
++        BindJob(job);
+       }
+-      return;
++      //return;
+     } else {
+       BindJob(job);
+     }
+@@ -590,23 +600,25 @@ const NetLogWithSource* HttpStreamFactory::JobController::GetNetLog() const {
+ void HttpStreamFactory::JobController::MaybeSetWaitTimeForMainJob(
+     const base::TimeDelta& delay) {
+   if (main_job_is_blocked_) {
+-    const bool has_available_spdy_session =
+-        main_job_->HasAvailableSpdySession();
+-    if (!delay_main_job_with_available_spdy_session_ &&
+-        has_available_spdy_session) {
+-      main_job_wait_time_ = base::TimeDelta();
+-    } else {
++    // const bool has_available_spdy_session =
++    //     main_job_->HasAvailableSpdySession();
++    // if (!delay_main_job_with_available_spdy_session_ &&
++    //     has_available_spdy_session) {
++    //   main_job_wait_time_ = base::TimeDelta();
++    // } else {
++    //   main_job_wait_time_ =
++    //       std::min(delay, base::Seconds(kMaxDelayTimeForMainJobSecs));
++    // }
++    // if (has_available_spdy_session) {
++    //   UMA_HISTOGRAM_TIMES("Net.HttpJob.MainJobWaitTimeWithAvailableSpdySession",
++    //                       main_job_wait_time_);
++    // } else {
++    //   UMA_HISTOGRAM_TIMES(
++    //       "Net.HttpJob.MainJobWaitTimeWithoutAvailableSpdySession",
++    //       main_job_wait_time_);
++    // }
+       main_job_wait_time_ =
+-          std::min(delay, base::Seconds(kMaxDelayTimeForMainJobSecs));
+-    }
+-    if (has_available_spdy_session) {
+-      UMA_HISTOGRAM_TIMES("Net.HttpJob.MainJobWaitTimeWithAvailableSpdySession",
+-                          main_job_wait_time_);
+-    } else {
+-      UMA_HISTOGRAM_TIMES(
+-          "Net.HttpJob.MainJobWaitTimeWithoutAvailableSpdySession",
+-          main_job_wait_time_);
+-    }
++      std::min(base::Seconds(kMaxDelayTimeForMainJobSecs), base::Seconds(kMaxDelayTimeForMainJobSecs));
+   }
+ }
+ 
+diff --git a/net/quic/quic_context.h b/net/quic/quic_context.h
+index a698a7aa46f..742521686dc 100644
+--- a/net/quic/quic_context.h
++++ b/net/quic/quic_context.h
+@@ -97,7 +97,7 @@ struct NET_EXPORT QuicParams {
+ 
+   // Retry requests which fail with QUIC_PROTOCOL_ERROR, and mark QUIC
+   // broken if the retry succeeds.
+-  bool retry_without_alt_svc_on_quic_errors = true;
++  bool retry_without_alt_svc_on_quic_errors = false;
+   // If true, all QUIC sessions are closed when any local IP address changes.
+   bool close_sessions_on_ip_change = false;
+   // If true, all QUIC sessions are marked as goaway when any local IP address
+-- 
+2.17.1
