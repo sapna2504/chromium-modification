@@ -1,0 +1,18 @@
+diff a/net/http/http_stream_factory_job_controller.cc b/net/http/http_stream_factory_job_controller.cc	(rejected hunks)
+@@ -599,8 +649,14 @@ const NetLogWithSource* HttpStreamFactory::JobController::GetNetLog() const {
+ void HttpStreamFactory::JobController::MaybeSetWaitTimeForMainJob(
+     const base::TimeDelta& delay) {
+   if (main_job_is_blocked_) {
+-    main_job_wait_time_ =
+-        std::min(delay, base::Seconds(kMaxDelayTimeForMainJobSecs));
++    if(getenv("should_fallback:") == NULL or strcmp(getenv("should_fallback:"),"0") != 0){
++      DVLOG(0) << "Time:" << GetAbsoluteCurrentTime()
++      << "delay-time:" << kMaxDelayTimeForMainJobSecs;
++      main_job_wait_time_ = std::min(base::Seconds(kMaxDelayTimeForMainJobSecs), base::Seconds(kMaxDelayTimeForMainJobSecs));
++    }
++    else{
++      main_job_wait_time_ = std::min(base::Seconds(kMaxDelayTimeForMainJobSecs), delay);
++    }
+     if (main_job_->HasAvailableSpdySession()) {
+       UMA_HISTOGRAM_TIMES("Net.HttpJob.MainJobWaitTimeWithAvailableSpdySession",
+                           main_job_wait_time_);
