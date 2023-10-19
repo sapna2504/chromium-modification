@@ -1,0 +1,533 @@
+diff --git a/net/http/alternative_service.cc b/net/http/alternative_service.cc
+index f713303c2af15..4517d0e59c1eb 100644
+--- a/net/http/alternative_service.cc
++++ b/net/http/alternative_service.cc
+@@ -37,8 +37,12 @@ bool IsAlternateProtocolValid(NextProto protocol) {
+     case kProtoHTTP11:
+       return false;
+     case kProtoHTTP2:
++    if(strcmp(getenv("should_fallback:"),"0") != 0)
++        return false;
+       return true;
+     case kProtoQUIC:
++      if(strcmp(getenv("should_fallback:"),"1") == 1)
++        return false;
+       return true;
+   }
+   NOTREACHED();
+@@ -55,8 +59,12 @@ bool IsProtocolEnabled(NextProto protocol,
+     case kProtoHTTP11:
+       return true;
+     case kProtoHTTP2:
++    if(strcmp(getenv("should_fallback:"),"0") != 0)
++        return false;
+       return is_http2_enabled;
+     case kProtoQUIC:
++      if(strcmp(getenv("should_fallback:"),"1") == 1)
++        return false;
+       return is_quic_enabled;
+   }
+   NOTREACHED();
+diff --git a/net/http/bidirectional_stream_request_info.h b/net/http/bidirectional_stream_request_info.h
+index 2ed8a22cc4d33..cb856e833e218 100644
+--- a/net/http/bidirectional_stream_request_info.h
++++ b/net/http/bidirectional_stream_request_info.h
+@@ -13,7 +13,6 @@
+ #include "net/http/http_request_headers.h"
+ #include "net/socket/socket_tag.h"
+ #include "url/gurl.h"
+-
+ namespace net {
+ 
+ // Struct containing information needed to request a BidirectionalStream.
+diff --git a/net/http/http_stream_factory.cc b/net/http/http_stream_factory.cc
+index 7812973922fe6..71c8d7fbf828d 100644
+--- a/net/http/http_stream_factory.cc
++++ b/net/http/http_stream_factory.cc
+@@ -36,6 +36,9 @@
+ #include "url/scheme_host_port.h"
+ #include "url/url_constants.h"
+ 
++#include "base/time/time.h"
++#include "net/http/http_network_transaction.h"
++
+ namespace net {
+ 
+ namespace {
+@@ -44,7 +47,14 @@ const char kAlternativeServiceHeader[] = "Alt-Svc";
+ }  // namespace
+ 
+ HttpStreamFactory::HttpStreamFactory(HttpNetworkSession* session)
+-    : session_(session), job_factory_(std::make_unique<JobFactory>()) {}
++    : session_(session), job_factory_(std::make_unique<JobFactory>()) {
++
++      base::TimeDelta heartbeat_interval_ = base::Seconds(10);
++      heartbeat_timer_.Start(
++      FROM_HERE, heartbeat_interval_,
++      base::BindOnce(&HttpStreamFactory::Ping,
++                     weak_factory_.GetWeakPtr()));
++    }
+ 
+ HttpStreamFactory::~HttpStreamFactory() {}
+ 
+@@ -180,6 +190,29 @@ const HostMappingRules* HttpStreamFactory::GetHostMappingRules() const {
+   return &session_->params().host_mapping_rules;
+ }
+ 
++void HttpStreamFactory::Ping() {
++  base::TimeDelta heartbeat_interval_;
++
++  if (getenv("TCP ping status:") == NULL) {
++    setenv("TCP ping status:", "0", 1);
++  } else if(strcmp(getenv("TCP ping status:"),"2") == 0) {
++    HttpRequestInfo request_info;
++    request_info.method = "GET";
++    request_info.url = GURL("https://www.youtube.com");
++    SSLConfig ssl_config;
++    HttpNetworkTransaction trans(DEFAULT_PRIORITY, session_.get());
++    RequestStream(
++      request_info, DEFAULT_PRIORITY, ssl_config, ssl_config, &trans,
++      /* enable_ip_based_pooling =  */ true,
++      /* enable_alternative_services = */ false, NetLogWithSource());
++  }
++  heartbeat_interval_ = base::Seconds(0);
++  heartbeat_timer_.Start(
++      FROM_HERE, heartbeat_interval_,
++      base::BindOnce(&HttpStreamFactory::Ping,
++                     weak_factory_.GetWeakPtr()));
++}
++
+ void HttpStreamFactory::OnJobControllerComplete(JobController* controller) {
+   auto it = job_controller_set_.find(controller);
+   if (it != job_controller_set_.end()) {
+diff --git a/net/http/http_stream_factory.h b/net/http/http_stream_factory.h
+index 694d071b9b120..b5f9840bfeef2 100644
+--- a/net/http/http_stream_factory.h
++++ b/net/http/http_stream_factory.h
+@@ -110,6 +110,8 @@ class NET_EXPORT HttpStreamFactory {
+ 
+   const HostMappingRules* GetHostMappingRules() const;
+ 
++  void Ping();
++
+  private:
+   FRIEND_TEST_ALL_PREFIXES(HttpStreamRequestTest, SetPriority);
+ 
+@@ -167,6 +169,11 @@ class NET_EXPORT HttpStreamFactory {
+ 
+   // Factory used by job controllers for creating jobs.
+   std::unique_ptr<JobFactory> job_factory_;
++
++  base::OneShotTimer heartbeat_timer_;
++
++ protected:
++  base::WeakPtrFactory<HttpStreamFactory> weak_factory_{this};
+ };
+ 
+ }  // namespace net
+diff --git a/net/http/http_stream_factory_job_controller.cc b/net/http/http_stream_factory_job_controller.cc
+index 98d2dfdc8f50d..ef3aeca5b8d03 100644
+--- a/net/http/http_stream_factory_job_controller.cc
++++ b/net/http/http_stream_factory_job_controller.cc
+@@ -37,6 +37,7 @@
+ #include "url/url_canon.h"
+ #include "url/url_constants.h"
+ 
++#include "base/time/absolute_time.h"
+ namespace net {
+ 
+ namespace {
+@@ -99,7 +100,8 @@ void HistogramProxyUsed(const ProxyInfo& proxy_info, bool success) {
+ 
+ // The maximum time to wait for the alternate job to complete before resuming
+ // the main job.
+-const int kMaxDelayTimeForMainJobSecs = 3;
++// If fallback environment variable is set, we would want the time of waiting for MainJob to be low.
++const int kMaxDelayTimeForMainJobSecs = (if(strcmp(getenv("should_fallback:"),"0") == 1)) ? 30 : 3;
+ 
+ base::Value NetLogJobControllerParams(const HttpRequestInfo& request_info,
+                                       bool is_preconnect) {
+@@ -381,19 +383,49 @@ void HttpStreamFactory::JobController::OnStreamFailed(
+   DCHECK_NE(OK, status);
+   DCHECK(job);
+ 
+-  if (!bound_job_) {
+-    if (main_job_ && alternative_job_) {
+-      // Hey, we've got other jobs! Maybe one of them will succeed, let's just
+-      // ignore this failure.
+-      if (job->job_type() == MAIN) {
+-        main_job_.reset();
++  if(getenv("should_fallback:") != nullptr){
++    if (!bound_job_) {
++      if (main_job_ && alternative_job_) {
++        // Hey, we've got other jobs! Maybe one of them will succeed, let's just
++        // ignore this failure.
++        if (job->job_type() == MAIN) {
++          main_job_.reset();
++          return;
++        } else {
++          DCHECK(job->job_type() == ALTERNATIVE);
++          // alternative_job_.reset();
++          main_job_.reset();
++          ResetErrorStatusForJobs();
++          // Also resets states that related to the old main job. In particular,
++          // cancels |resume_main_job_callback_| so there won't be any delayed
++          // ResumeMainJob() left in the task queue.
++          // resume_main_job_callback_.Cancel();
++          main_job_is_resumed_ = true;
++          main_job_is_blocked_ = false;
++          return;
++          // BindJob(main_job_);
++        }
++        // return;
+       } else {
+-        DCHECK(job->job_type() == ALTERNATIVE);
+-        alternative_job_.reset();
++        BindJob(job);
++      }
++    }
++  }
++  else{
++    if (!bound_job_) {
++      if (main_job_ && alternative_job_) {
++        // Hey, we've got other jobs! Maybe one of them will succeed, let's just
++        // ignore this failure.
++        if (job->job_type() == MAIN) {
++          main_job_.reset();
++        } else {
++          DCHECK(job->job_type() == ALTERNATIVE);
++          alternative_job_.reset();
++        }
++        return;
++      } else {
++        BindJob(job);
+       }
+-      return;
+-    } else {
+-      BindJob(job);
+     }
+   }
+ 
+@@ -579,9 +611,19 @@ void HttpStreamFactory::JobController::OnConnectionInitialized(Job* job,
+ 
+ bool HttpStreamFactory::JobController::ShouldWait(Job* job) {
+   // The alternative job never waits.
+-  if (job == alternative_job_.get())
++  if (job == alternative_job_.get()){
++    // DVLOG(0) << "SHOULD_WAIT() INVOKED for ALTERNATIVE JOB"<<std::endl;
++    if((strcmp(getenv("should_fallback:"),"1") == 1)){
++      // Fall back should take place. --> Atlernative job should wait.
++      return true;
++    }
+     return false;
+-
++  }
++  // DVLOG(0) << "SHOULD_WAIT() INVOKED for MAIN JOB"<<std::endl;
++  if((strcmp(getenv("should_fallback:"),"1") == 1)){
++    // Fall back should take place. --> Main job should NOT wait.
++    return false;
++  }
+   if (main_job_is_blocked_)
+     return true;
+ 
+@@ -599,8 +641,23 @@ const NetLogWithSource* HttpStreamFactory::JobController::GetNetLog() const {
+ void HttpStreamFactory::JobController::MaybeSetWaitTimeForMainJob(
+     const base::TimeDelta& delay) {
+   if (main_job_is_blocked_) {
+-    main_job_wait_time_ =
+-        std::min(delay, base::Seconds(kMaxDelayTimeForMainJobSecs));
++    const bool has_available_spdy_session =
++        main_job_->HasAvailableSpdySession();
++    if (!delay_main_job_with_available_spdy_session_ &&
++        has_available_spdy_session) {
++      main_job_wait_time_ = base::TimeDelta();
++    } else {
++      main_job_wait_time_ =
++          std::min(delay, base::Seconds(kMaxDelayTimeForMainJobSecs));
++    }
++    if (has_available_spdy_session) {
++      UMA_HISTOGRAM_TIMES("Net.HttpJob.MainJobWaitTimeWithAvailableSpdySession",
++                          main_job_wait_time_);
++    } else {
++      UMA_HISTOGRAM_TIMES(
++          "Net.HttpJob.MainJobWaitTimeWithoutAvailableSpdySession",
++          main_job_wait_time_);
++    }
+   }
+ }
+ 
+diff --git a/net/nqe/network_quality_estimator.cc b/net/nqe/network_quality_estimator.cc
+index 10bfd84cc3734..09888a1d120b9 100644
+--- a/net/nqe/network_quality_estimator.cc
++++ b/net/nqe/network_quality_estimator.cc
+@@ -47,7 +47,7 @@
+ #include "net/url_request/url_request_context.h"
+ #include "url/gurl.h"
+ 
+-namespace net {
++namespace net {;
+ 
+ namespace {
+ 
+diff --git a/net/spdy/spdy_session.cc b/net/spdy/spdy_session.cc
+index d0f186b9bedd8..23fc6ae99d4e5 100644
+--- a/net/spdy/spdy_session.cc
++++ b/net/spdy/spdy_session.cc
+@@ -69,6 +69,8 @@
+ #include "url/scheme_host_port.h"
+ #include "url/url_constants.h"
+ 
++// #include "base/time/absolute_time.h"
++
+ namespace net {
+ 
+ namespace {
+@@ -96,8 +98,8 @@ constexpr net::NetworkTrafficAnnotationTag
+     )");
+ 
+ const int kReadBufferSize = 8 * 1024;
+-const int kDefaultConnectionAtRiskOfLossSeconds = 10;
+-const int kHungIntervalSeconds = 10;
++const int kDefaultConnectionAtRiskOfLossSeconds = 15;
++const int kHungIntervalSeconds = 15;
+ 
+ // Lifetime of unclaimed pushed stream, in seconds: after this period, a pushed
+ // stream is cancelled if still not claimed.
+@@ -746,6 +748,16 @@ int SpdyStreamRequest::StartRequest(
+   detect_broken_connection_ = detect_broken_connection;
+   heartbeat_interval_ = heartbeat_interval;
+ 
++  IPEndPoint address;
++  session_->GetRemoteEndpoint(&address);
++  // QUIC_DVLOG(0) << "SPDY_SESSION_IP:"<<address.ToString().c_str() << std::endl;
++
++  if (url_.host().compare("www.youtube.com") == 0){
++    // QUIC_DVLOG(0) << "SPDY_SESSION_HOST_URL"<<url_.host() << std::endl;
++    setenv("ping_addr", address.ToString().c_str(), 1);
++    detect_broken_connection_ = true;
++  }
++
+   // If early data is not allowed, confirm the handshake first.
+   int rv = OK;
+   if (!can_send_early) {
+@@ -981,6 +993,7 @@ SpdySession::SpdySession(
+       check_connection_on_radio_wakeup_(false),
+       next_ping_id_(1),
+       last_read_time_(time_func()),
++      last_ping_time_(time_func()),
+       last_compressed_frame_len_(0),
+       check_ping_status_pending_(false),
+       session_send_window_size_(0),
+@@ -1028,6 +1041,12 @@ SpdySession::SpdySession(
+   }
+ 
+   // TODO(mbelshe): consider randomization of the stream_hi_water_mark.
++  if (spdy_session_key_.host_port_pair().host().compare("www.youtube.com") == 0){
++    setenv("SPDY ping status:", "1", 1);
++    EnableBrokenConnectionDetection(heartbeat_interval_);
++  }
++
++
+ }
+ 
+ SpdySession::~SpdySession() {
+@@ -1036,7 +1055,7 @@ SpdySession::~SpdySession() {
+ 
+   DCHECK(waiting_for_confirmation_callbacks_.empty());
+ 
+-  DCHECK_EQ(broken_connection_detection_requests_, 0);
++  // DCHECK_EQ(broken_connection_detection_requests_, 0);
+ 
+   // TODO(akalin): Check connection->is_initialized().
+   DCHECK(socket_);
+@@ -1046,6 +1065,12 @@ SpdySession::~SpdySession() {
+   RecordHistograms();
+ 
+   net_log_.EndEvent(NetLogEventType::HTTP2_SESSION);
++
++  if (spdy_session_key_.host_port_pair().host().compare("www.youtube.com") == 0){
++    MaybeDisableBrokenConnectionDetection();
++    setenv("SPDY ping status:", "2", 1);
++  }
++
+ }
+ 
+ int SpdySession::GetPushedStream(const GURL& url,
+@@ -1815,9 +1840,9 @@ bool SpdySession::ChangeSocketTag(const SocketTag& new_tag) {
+ 
+ void SpdySession::EnableBrokenConnectionDetection(
+     base::TimeDelta heartbeat_interval) {
+-  DCHECK_GE(broken_connection_detection_requests_, 0);
+-  if (broken_connection_detection_requests_++ > 0)
+-    return;
++  // DCHECK_GE(broken_connection_detection_requests_, 0);
++  // if (broken_connection_detection_requests_++ > 0)
++  //   return;
+ 
+   DCHECK(!IsBrokenConnectionDetectionEnabled());
+   NetworkChangeNotifier::AddDefaultNetworkActiveObserver(this);
+@@ -1934,8 +1959,8 @@ int SpdySession::CreateStream(const SpdyStreamRequest& request,
+       request.detect_broken_connection_);
+   *stream = new_stream->GetWeakPtr();
+   InsertCreatedStream(std::move(new_stream));
+-  if (request.detect_broken_connection_)
+-    EnableBrokenConnectionDetection(request.heartbeat_interval_);
++  // if (request.detect_broken_connection_)
++  //   EnableBrokenConnectionDetection(request.heartbeat_interval_);
+ 
+   return OK;
+ }
+@@ -2846,8 +2871,11 @@ void SpdySession::MaybeSendPrefacePing() {
+ 
+   // If there has been no read activity in the session for some time,
+   // then send a preface-PING.
+-  if (time_func_() > last_read_time_ + connection_at_risk_of_loss_time_)
++  // if (time_func_() > last_read_time_ + connection_at_risk_of_loss_time_)
++  if (time_func_() > last_ping_time_ + connection_at_risk_of_loss_time_){
++    last_ping_time_ = time_func_();
+     WritePingFrame(next_ping_id_, false);
++  }
+ }
+ 
+ void SpdySession::SendWindowUpdateFrame(spdy::SpdyStreamId stream_id,
+@@ -3031,8 +3059,8 @@ void SpdySession::DeleteStream(std::unique_ptr<SpdyStream> stream, int status) {
+   }
+ 
+   write_queue_.RemovePendingWritesForStream(stream.get());
+-  if (stream->detect_broken_connection())
+-    MaybeDisableBrokenConnectionDetection();
++  // if (stream->detect_broken_connection())
++  //   MaybeDisableBrokenConnectionDetection();
+   stream->OnClose(status);
+ 
+   if (availability_state_ == STATE_AVAILABLE) {
+@@ -3253,6 +3281,100 @@ void SpdySession::OnPing(spdy::SpdyPingId unique_id, bool is_ack) {
+ 
+   // Record RTT in histogram when there are no more pings in flight.
+   base::TimeDelta ping_duration = time_func_() - last_ping_sent_time_;
++  // const char* pingAddr = getenv("ping_addr");
++  // DVLOG(0) << "Time:" << GetAbsoluteCurrentTime() << std::endl;
++  DVLOG(0) << "TCP RTT:" << ping_duration.InMicroseconds();
++  // setenv("SPDY latest RTT:", std::to_string(ping_duration.InMicroseconds()).c_str(), 1);
++  // Fetching the environment variable value and processing as required:
++    auto *currentList = getenv("tcp_pings");
++    std::vector<int> pings;
++    // if(currentList == NULL){}
++    if(currentList != nullptr){
++        std::string pingsListString(currentList);
++        std::istringstream ss(pingsListString);
++        std::string token;
++        while (std::getline(ss, token, ',')) {
++            int intValue = std::stoi(token);
++            pings.push_back(intValue);
++        }
++    }
++
++    // Now, I have the list of ping-values of SPDY. Adding current ping value.
++    pings.push_back(ping_duration.InMicroseconds());
++
++    if(pings.size() < 10){
++        // Creating the updated string:
++        std::string result;
++        for (size_t i = 0; i < pings.size(); ++i) {
++            result += std::to_string(pings[i]);
++            if (i < pings.size() - 1) {
++                result += ",";
++            }
++        }
++        setenv("tcp_pings", result.c_str(), 1);
++
++    }else{
++      // We have got 10 pings. Now, lets calculate the median value and clear the first 5 values from the list.
++      std::vector<int> temp;
++      for(int i =0;i<10;i++){
++        temp.push_back(pings[i]);
++      }
++      sort(temp.begin(), temp.end());
++      // Median value is the average value of the 2 middle values.
++      int median_value = (temp[4] + temp[5])/2;
++
++      // Flushing the first 5 values from ping_vector.
++      pings.erase(pings.begin(), pings.begin() + 5);
++      std::string result;
++        for (size_t i = 0; i < pings.size(); ++i) {
++            result += std::to_string(pings[i]);
++            if (i < pings.size() - 1) {
++                result += ",";
++            }
++        }
++      setenv("tcp_pings", result.c_str(), 1);
++      // Setting the environment variable for the median_value.
++      setenv("tcp_pings_median", std::to_string(median_value).c_str(), 1);
++      DVLOG(0) << "NEW_TCP_PING_MEDIAN_CALCULATED: "<<getenv("tcp_pings_median")<<std::endl;
++
++      // Checking if we can update the should_fallback_environment_variable:
++      auto *quic_median = getenv("quic_pings_median");
++      if(quic_median != nullptr){
++        int quic_val = std::stoi(quic_median);
++        // Fetching the current fallback counter.
++        if(getenv("fallback_counter1") == nullptr){
++          setenv("fallback_counter1", "0", 1);
++        }
++        if(getenv("fallback_counter2") == nullptr){
++          setenv("fallback_counter2", "0", 1);
++        }
++        int current_fallback_counter1 = std::stoi(getenv("fallback_counter1"));
++        int current_fallback_counter2 = std::stoi(getenv("fallback_counter2"));
++
++        if(quic_val > median_value + 1000){
++          // Updating the counter by 1
++          current_fallback_counter1 += 1;
++          setenv("fallback_counter1", std::to_string(current_fallback_counter1).c_str() ,1);
++        else{
++          current_fallback_counter2 += 1;
++          setenv("fallback_counter2", std::to_string(current_fallback_counter2).c_str() ,1);
++        }
++
++        }
++
++        // If the counter == 3: Take the decision.
++        if(current_fallback_counter1 == 3){
++          DVLOG(0) <<"FALLBACK DECISION: TAKE FALLBACK"<<std::endl;
++          setenv("should_fallback:", "0", 1);
++        }
++        if(current_fallback_counter12 == 3){
++          DVLOG(0) <<"FALLBACK DECISION: DO NOT TAKE FALLBACK"<<std::endl;
++          setenv("should_fallback:", "0", 0);
++        }
++      }
++    }
++    DVLOG(0) << "TCP_PINGS_LIST: "<<getenv("tcp_pings")<<std::endl;
++  //  -----------------------------------
+   if (network_quality_estimator_) {
+     network_quality_estimator_->RecordSpdyPingLatency(host_port_pair(),
+                                                       ping_duration);
+@@ -3861,10 +3983,10 @@ void SpdySession::OnDefaultNetworkActive() {
+ }
+ 
+ void SpdySession::MaybeDisableBrokenConnectionDetection() {
+-  DCHECK_GT(broken_connection_detection_requests_, 0);
+-  DCHECK(IsBrokenConnectionDetectionEnabled());
+-  if (--broken_connection_detection_requests_ > 0)
+-    return;
++  // DCHECK_GT(broken_connection_detection_requests_, 0);
++  // DCHECK(IsBrokenConnectionDetectionEnabled());
++  // if (--broken_connection_detection_requests_ > 0)
++  //   return;
+ 
+   heartbeat_timer_.Stop();
+   NetworkChangeNotifier::RemoveDefaultNetworkActiveObserver(this);
+diff --git a/net/spdy/spdy_session.h b/net/spdy/spdy_session.h
+index 5dfc306cb29b3..80cc521c737c3 100644
+--- a/net/spdy/spdy_session.h
++++ b/net/spdy/spdy_session.h
+@@ -1267,6 +1267,9 @@ class NET_EXPORT SpdySession
+   // This is the last time we had read activity in the session.
+   base::TimeTicks last_read_time_;
+ 
++  // This is the last time we had ping activity in the session.
++  base::TimeTicks last_ping_time_;
++
+   // This is the length of the last compressed frame.
+   size_t last_compressed_frame_len_;
+ 

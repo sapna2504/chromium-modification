@@ -1,0 +1,250 @@
+diff --git a/quiche/quic/core/quic_connection.cc b/quiche/quic/core/quic_connection.cc
+index de739d6d..f1aaac81 100644
+--- a/quiche/quic/core/quic_connection.cc
++++ b/quiche/quic/core/quic_connection.cc
+@@ -359,6 +359,14 @@ QuicConnection::QuicConnection(
+     }
+   }
+   packet_creator_.SetDefaultPeerAddress(initial_peer_address);
++  // auto spdy_ping_address = getenv("ping_addr");
++  // if(spdy_ping_address !=nullptr){
++  //   std::string spdyPingAddress(spdy_ping_address);
++  //   std::string quicPeerAddress = initial_peer_address.ToString();
++  //   if(spdyPingAddress == quicPeerAddress){
++  //     // QUIC_DVLOG(0)<<"QUIC AND SPDY IPS MATCHED!"<<std::endl;
++  //   }
++  // }
+ }
+ 
+ void QuicConnection::InstallInitialCrypters(QuicConnectionId connection_id) {
+@@ -2761,7 +2769,7 @@ void QuicConnection::ProcessUdpPacket(const QuicSocketAddress& self_address,
+     MaybeProcessUndecryptablePackets();
+     MaybeSendInResponseToPacket();
+   }
+-  SetPingAlarm();
++  // SetPingAlarm();
+   RetirePeerIssuedConnectionIdsNoLongerOnPath();
+   current_packet_data_ = nullptr;
+   is_current_packet_connectivity_probing_ = false;
+@@ -3643,7 +3651,7 @@ bool QuicConnection::WritePacket(SerializedPacket* packet) {
+                  in_flight, packet->encryption_level)) {
+     SetRetransmissionAlarm();
+   }
+-  SetPingAlarm();
++  // SetPingAlarm();
+   RetirePeerIssuedConnectionIdsNoLongerOnPath();
+ 
+   // The packet number length must be updated after OnPacketSent, because it
+@@ -4027,11 +4035,30 @@ void QuicConnection::SendOrQueuePacket(SerializedPacket packet) {
+ }
+ 
+ void QuicConnection::OnPingTimeout() {
+-  if (retransmission_alarm_->IsSet() ||
+-      !visitor_->ShouldKeepConnectionAlive()) {
+-    return;
++  // if (retransmission_alarm_->IsSet() ||
++  //     !visitor_->ShouldKeepConnectionAlive()) {
++  //   return;
++  // }
++
++  // Fetching the current largest packet number.
++  // auto ip_addr = getenv("ping_addr");
++  auto spdy_ping_address = getenv("ping_addr");
++  std::string spdyPingAddress(spdy_ping_address);
++  auto quic_peer_address = GetEffectivePeerAddressFromCurrentPacket();
++  std::string quicPeerAddress = quic_peer_address.ToString();
++  if(spdyPingAddress == quicPeerAddress){
++    QuicPacketNumber next_packet_number = sent_packet_manager_.GetLargestSentPacket() + 1; 
++    SendPingAtLevel(framer().GetEncryptionLevelToSendApplicationData());
++    stats_.ping_packet_numbers.insert(next_packet_number);
++  }
++  else{
++    // If IPs are different, simply work the normal way: 
++      if (retransmission_alarm_->IsSet() ||
++          !visitor_->ShouldKeepConnectionAlive()) {
++          return;
++      }
++      SendPingAtLevel(framer().GetEncryptionLevelToSendApplicationData());
+   }
+-  SendPingAtLevel(framer().GetEncryptionLevelToSendApplicationData());
+ }
+ 
+ void QuicConnection::SendAck() {
+@@ -4658,12 +4685,12 @@ void QuicConnection::SetPingAlarm() {
+     // flight.
+     return;
+   }
+-  if (!visitor_->ShouldKeepConnectionAlive()) {
+-    ping_alarm_->Cancel();
+-    // Don't send a ping unless the application (ie: HTTP/3) says to, usually
+-    // because it is expecting a response from the server.
+-    return;
+-  }
++  // if (!visitor_->ShouldKeepConnectionAlive()) {
++  //   ping_alarm_->Cancel();
++  //   // Don't send a ping unless the application (ie: HTTP/3) says to, usually
++  //   // because it is expecting a response from the server.
++  //   return;
++  // }
+   if (initial_retransmittable_on_wire_timeout_.IsInfinite() ||
+       sent_packet_manager_.HasInFlightPackets() ||
+       retransmittable_on_wire_ping_count_ >
+@@ -6220,6 +6247,7 @@ void QuicConnection::OnHandshakeTimeout() {
+     absl::StrAppend(&error_details, UndecryptablePacketsInfo());
+   }
+   QUIC_DVLOG(1) << ENDPOINT << error_details;
++  QUIC_DVLOG(0) << "Handshake Timeout detected after" << duration.ToDebuggingValue();
+   CloseConnection(QUIC_HANDSHAKE_TIMEOUT, error_details,
+                   ConnectionCloseBehavior::SEND_CONNECTION_CLOSE_PACKET);
+ }
+@@ -6249,6 +6277,8 @@ void QuicConnection::OnIdleNetworkDetected() {
+       absl::StrAppend(&error_details, ", ",
+                       visitor_->GetStreamsInfoForLogging());
+     }
++    QUIC_DVLOG(0) << "Idle Timeout detected after" << duration.ToDebuggingValue();
++    
+     CloseConnection(QUIC_NETWORK_IDLE_TIMEOUT, error_details,
+                     ConnectionCloseBehavior::SEND_CONNECTION_CLOSE_PACKET);
+     return;
+@@ -6600,6 +6630,16 @@ void QuicConnection::UpdatePeerAddress(QuicSocketAddress peer_address) {
+ void QuicConnection::SendPingAtLevel(EncryptionLevel level) {
+   ScopedEncryptionLevelContext context(this, level);
+   SendControlFrame(QuicFrame(QuicPingFrame()));
++  // Only setting periodic alarm for the same IP as that of the SPDY session:
++  auto spdy_ping_address = getenv("ping_addr");
++  std::string spdyPingAddress(spdy_ping_address);
++  auto quic_peer_address = GetEffectivePeerAddressFromCurrentPacket();
++  std::string quicPeerAddress = quic_peer_address.ToString();
++  // QUIC_DVLOG(0)<<"QUIC_IP_ADDRESS: "<<quic_peer_address<<std::endl;
++  // QUIC_DVLOG(0)<<"SPDY_IP_ADDRESS: "<<spdyPingAddress<<std::endl;
++  if(spdyPingAddress == quicPeerAddress){
++    SetPingAlarm();
++  }
+ }
+ 
+ bool QuicConnection::HasPendingPathValidation() const {
+diff --git a/quiche/quic/core/quic_connection_stats.h b/quiche/quic/core/quic_connection_stats.h
+index 4aaf7800..e99e0e3c 100644
+--- a/quiche/quic/core/quic_connection_stats.h
++++ b/quiche/quic/core/quic_connection_stats.h
+@@ -7,6 +7,8 @@
+ 
+ #include <cstdint>
+ #include <ostream>
++#include<set>   // For set storing QuicPacketNumbers once ping is sent.
++
+ 
+ #include "quiche/quic/core/quic_bandwidth.h"
+ #include "quiche/quic/core/quic_packets.h"
+@@ -131,6 +133,10 @@ struct QUIC_EXPORT_PRIVATE QuicConnectionStats {
+   // one or more lost packets.
+   uint32_t tcp_loss_events = 0;
+ 
++  // Adding a set for storing QuicPacketNumber of packets while sending RTT pings.
++  std::set<QuicPacketNumber> ping_packet_numbers;
++  uint64_t ping_counter = 0;
++
+   // Creation time, as reported by the QuicClock.
+   QuicTime connection_creation_time = QuicTime::Zero();
+ 
+diff --git a/quiche/quic/core/quic_sent_packet_manager.cc b/quiche/quic/core/quic_sent_packet_manager.cc
+index 47377e13..29db5fc0 100644
+--- a/quiche/quic/core/quic_sent_packet_manager.cc
++++ b/quiche/quic/core/quic_sent_packet_manager.cc
+@@ -7,6 +7,10 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <string>
++#include<cstdlib>
++#include<vector>
++#include<iostream>
++#include<sstream>
+ 
+ #include "quiche/quic/core/congestion_control/general_loss_algorithm.h"
+ #include "quiche/quic/core/congestion_control/pacing_sender.h"
+@@ -1248,6 +1252,8 @@ bool QuicSentPacketManager::MaybeUpdateRTT(QuicPacketNumber largest_acked,
+ 
+   QuicTime::Delta send_delta = ack_receive_time - transmission_info.sent_time;
+   const bool min_rtt_available = !rtt_stats_.min_rtt().IsZero();
++  // const QuicTime now_time = clock_->ApproximateNow();
++  // QUIC_DVLOG(0) << "QUIC RTT used in congestion control: " << send_delta << " at time " << now_time;
+   rtt_stats_.UpdateRtt(send_delta, ack_delay_time, ack_receive_time);
+ 
+   if (!min_rtt_available && !rtt_stats_.min_rtt().IsZero()) {
+@@ -1577,6 +1583,76 @@ void QuicSentPacketManager::OnAckFrameStart(QuicPacketNumber largest_acked,
+       ack_delay_time = QuicTime::Delta::Zero();
+     }
+   }
++
++  // Checking if the largest_acked is present in the ping_packet_numbers set. 
++  auto idx = stats_->ping_packet_numbers.find(largest_acked);
++  if(idx != stats_->ping_packet_numbers.end()){
++    // Packet Number acked present in the set.
++    // Updating the ping counter & the ping_packet_numbers_set.
++    stats_->ping_counter ++;
++    stats_->ping_packet_numbers.erase(largest_acked);
++    const QuicTransmissionInfo& transmission_info = unacked_packets_.GetTransmissionInfo(largest_acked);
++    QuicTime::Delta rtt_computed = ack_receive_time - transmission_info.sent_time;
++    // Logging the information.
++    // QUIC_DVLOG(0) << "PING_PACKET_NO:" << largest_acked<<std::endl;
++    // QUIC_DVLOG(0)<<"PING_PACKET_NUMBERS_SET_SIZE: "<<size(stats_->ping_packet_numbers)<<std::endl;
++    QUIC_DVLOG(0) << "QUIC RTT: " << rtt_computed.ToMicroseconds() <<std::endl;
++    // QUIC_DVLOG(0) << "QUIC RTT COUNT: " << stats_->ping_counter<< std::endl;
++
++    // Fetching the environment variable value and processing as required:
++    auto currentList = getenv("quic_pings");
++    std::vector<int> pings;
++    // if(currentList == NULL){}
++    if(currentList != nullptr){
++        std::string pingsListString(currentList);
++        std::istringstream ss(pingsListString);
++        std::string token;
++        while (std::getline(ss, token, ',')) {
++            int intValue = std::stoi(token);
++            pings.push_back(intValue);
++        }
++    }
++
++    // Now, I have the list of ping-values of QUIC. Adding current ping value.
++    pings.push_back(rtt_computed.ToMicroseconds());
++
++    if(pings.size() < 10){
++        // Creating the updated string:
++        std::string result;
++        for (size_t i = 0; i < pings.size(); ++i) {
++            result += std::to_string(pings[i]);
++            if (i < pings.size() - 1) {
++                result += ",";
++            }
++        }
++        setenv("quic_pings", result.c_str(), 1);
++
++    }else{
++      // We have got 10 pings. Now, lets calculate the median value and clear the first 5 values from the list.
++      std::vector<int> temp;
++      for(int i =0;i<10;i++){
++        temp.push_back(pings[i]);
++      }
++      sort(temp.begin(), temp.end());
++      // Median value is the average value of the 2 middle values.
++      int median_value = (temp[4] + temp[5])/2;
++
++      // Flushing the first 5 values from ping_vector.
++      pings.erase(pings.begin(), pings.begin() + 5);
++      std::string result;
++        for (size_t i = 0; i < pings.size(); ++i) {
++            result += std::to_string(pings[i]);
++            if (i < pings.size() - 1) {
++                result += ",";
++            }
++        }
++      setenv("quic_pings", result.c_str(), 1);
++      // Setting the environment variable for the median_value.
++      setenv("quic_pings_median", std::to_string(median_value).c_str(), 1);
++      QUIC_DVLOG(0) << "NEW_QUIC_PING_MEDIAN_CALCULATED: "<<getenv("quic_pings_median")<<std::endl;
++    }
++    QUIC_DVLOG(0) << "QUIC_PINGS_LIST: "<<getenv("quic_pings")<<std::endl;
++  }
+   rtt_updated_ =
+       MaybeUpdateRTT(largest_acked, ack_delay_time, ack_receive_time);
+   last_ack_frame_.ack_delay_time = ack_delay_time;
